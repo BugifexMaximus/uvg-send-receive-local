@@ -1,0 +1,7 @@
+build
+build_logger
+decoded_frames
+decoded_frames_logger
+examples/toy_frames*
+**/cmake
+uvgRTP/**

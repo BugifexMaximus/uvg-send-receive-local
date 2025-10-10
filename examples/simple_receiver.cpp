@@ -9,11 +9,23 @@ extern "C" {
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
+#include <deque>
+#include <filesystem>
+#include <iomanip>
 #include <iostream>
 #include <memory>
 #include <mutex>
+#include <sstream>
+#include <system_error>
 #include <string>
+#include <thread>
 #include <vector>
+
+#include <opencv2/core.hpp>
+#include <opencv2/imgcodecs.hpp>
+#include <opencv2/imgproc.hpp>
+
+namespace fs = std::filesystem;
 
 struct AVCodecContextDel {
     void operator()(AVCodecContext* ctx) const
@@ -46,6 +58,7 @@ struct ProgramOptions {
     uint16_t remote_port = 2304;
     int max_frames = -1;
     int total_timeout_ms = 0;
+    std::string output_dir = "decoded_frames";
     bool verbose = false;
 
     static void print_help(const char* argv0)
@@ -57,6 +70,7 @@ struct ProgramOptions {
                   << "  --remote-port N       Sender port if different (default: 2304)\n"
                   << "  --max-frames N        Stop after N decoded frames (default: unlimited)\n"
                   << "  --total-timeout-ms N  Abort after N ms without finishing (default: unlimited)\n"
+                  << "  --output-dir DIR      Directory to store decoded frames (default: decoded_frames)\n"
                   << "  --verbose | -v        Verbose logging\n"
                   << "  -h | --help           This help\n";
     }
@@ -96,6 +110,10 @@ struct ProgramOptions {
                 if (!need("--total-timeout-ms"))
                     return false;
                 total_timeout_ms = std::stoi(argv[++i]);
+            } else if (a == "--output-dir") {
+                if (!need("--output-dir"))
+                    return false;
+                output_dir = argv[++i];
             } else if (a == "--verbose" || a == "-v") {
                 verbose = true;
             } else if (a == "-h" || a == "--help") {
@@ -130,7 +148,13 @@ struct ProgramOptions {
 struct Receiver {
     explicit Receiver(const ProgramOptions& opt)
         : opt_(opt)
+        , output_dir_(opt.output_dir)
     {
+    }
+
+    ~Receiver()
+    {
+        shutdown();
     }
 
     bool init()
@@ -158,6 +182,7 @@ struct Receiver {
             std::cerr << "av_frame_alloc failed\n";
             return false;
         }
+        start_saver();
         return true;
     }
 
@@ -235,8 +260,10 @@ struct Receiver {
             return;
         }
 
+        int frame_index = 0;
         {
             std::lock_guard<std::mutex> lock(mutex_);
+            frame_index = decoded_;
             ++decoded_;
             if (opt_.verbose) {
                 std::cerr << "decoded frame " << decoded_ << " (" << f.width << "x" << f.height << ")\n";
@@ -246,6 +273,7 @@ struct Receiver {
                 exit_code_ = 0;
             }
         }
+        enqueue_save_job(frame_index, f.width, f.height);
         cv_.notify_one();
     }
 
@@ -283,6 +311,11 @@ struct Receiver {
         return finished_;
     }
 
+    void shutdown()
+    {
+        shutdown_saver_internal();
+    }
+
 private:
     struct ConvertState {
         int width = 0;
@@ -291,17 +324,124 @@ private:
         std::unique_ptr<SwsContext, SwsContextDel> sws;
     };
 
+    struct SaveJob {
+        int index = 0;
+        int width = 0;
+        int height = 0;
+        std::vector<uint8_t> rgb;
+    };
+
+    void start_saver()
+    {
+        if (output_dir_.empty())
+            return;
+        {
+            std::lock_guard<std::mutex> lock(save_mutex_);
+            if (saver_started_)
+                return;
+            save_stop_ = false;
+            save_queue_.clear();
+            saver_started_ = true;
+        }
+        saver_ = std::thread(&Receiver::save_worker, this);
+    }
+
+    void enqueue_save_job(int index, int width, int height)
+    {
+        if (output_dir_.empty())
+            return;
+
+        SaveJob job;
+        job.index = index;
+        job.width = width;
+        job.height = height;
+        job.rgb.assign(rgb_.begin(), rgb_.end());
+
+        {
+            std::lock_guard<std::mutex> lock(save_mutex_);
+            save_queue_.push_back(std::move(job));
+        }
+        save_cv_.notify_one();
+    }
+
+    void save_worker()
+    {
+        std::unique_lock<std::mutex> lock(save_mutex_);
+        while (true) {
+            save_cv_.wait(lock, [&] { return save_stop_ || !save_queue_.empty(); });
+            if (save_stop_ && save_queue_.empty())
+                break;
+            SaveJob job = std::move(save_queue_.front());
+            save_queue_.pop_front();
+            lock.unlock();
+            write_job(job);
+            lock.lock();
+        }
+    }
+
+    void write_job(const SaveJob& job)
+    {
+        if (output_dir_.empty())
+            return;
+
+        cv::Mat rgb(job.height, job.width, CV_8UC3, const_cast<uint8_t*>(job.rgb.data()));
+        cv::Mat bgr;
+        cv::cvtColor(rgb, bgr, cv::COLOR_RGB2BGR);
+
+        fs::path path = fs::path(output_dir_) / make_filename(job.index);
+        try {
+            if (!cv::imwrite(path.string(), bgr) && opt_.verbose) {
+                std::cerr << "Failed to write " << path << "\n";
+            }
+        } catch (const cv::Exception& e) {
+            if (opt_.verbose) {
+                std::cerr << "imwrite exception for " << path << ": " << e.what() << "\n";
+            }
+        }
+    }
+
+    std::string make_filename(int index) const
+    {
+        std::ostringstream name;
+        name << "frame_" << std::setw(5) << std::setfill('0') << index << ".png";
+        return name.str();
+    }
+
+    void shutdown_saver_internal()
+    {
+        std::unique_lock<std::mutex> lock(save_mutex_);
+        if (!saver_started_)
+            return;
+        save_stop_ = true;
+        lock.unlock();
+        save_cv_.notify_all();
+        if (saver_.joinable())
+            saver_.join();
+        lock.lock();
+        save_queue_.clear();
+        saver_started_ = false;
+        save_stop_ = false;
+    }
+
     ProgramOptions opt_;
     std::unique_ptr<AVCodecContext, AVCodecContextDel> decoder_;
     std::unique_ptr<AVFrame, AVFrameDel> frame_;
     ConvertState convert_;
     std::vector<uint8_t> rgb_;
+    std::string output_dir_;
 
     std::mutex mutex_;
     std::condition_variable cv_;
     int decoded_ = 0;
     bool finished_ = false;
     int exit_code_ = 0;
+
+    std::deque<SaveJob> save_queue_;
+    std::mutex save_mutex_;
+    std::condition_variable save_cv_;
+    bool save_stop_ = false;
+    bool saver_started_ = false;
+    std::thread saver_;
 };
 
 int main(int argc, char** argv)
@@ -311,6 +451,15 @@ int main(int argc, char** argv)
     ProgramOptions opt;
     if (!opt.parse(argc, argv))
         return 1;
+
+    if (!opt.output_dir.empty()) {
+        std::error_code ec;
+        fs::create_directories(opt.output_dir, ec);
+        if (ec) {
+            std::cerr << "Failed to create output directory '" << opt.output_dir << "': " << ec.message() << "\n";
+            return 1;
+        }
+    }
 
     uvgrtp::context ctx;
 
@@ -363,5 +512,7 @@ int main(int argc, char** argv)
         std::cerr << "\n";
     }
 
-    return receiver.wait_until_done();
+    int rc = receiver.wait_until_done();
+    receiver.shutdown();
+    return rc;
 }
