@@ -10,6 +10,15 @@ set(UVGRTP_DISABLE_INSTALL ON CACHE BOOL "" FORCE)
 
 add_subdirectory(uvgRTP)
 
+target_sources(uvgrtp PRIVATE
+    ${CMAKE_SOURCE_DIR}/uvgRTP/customizations/packet_capture.cpp
+)
+
+target_include_directories(uvgrtp PUBLIC
+    ${CMAKE_SOURCE_DIR}/uvgRTP
+    ${CMAKE_SOURCE_DIR}/uvgRTP/customizations
+)
+
 find_package(OpenCV REQUIRED COMPONENTS core imgproc imgcodecs)
 
 find_package(PkgConfig REQUIRED)
