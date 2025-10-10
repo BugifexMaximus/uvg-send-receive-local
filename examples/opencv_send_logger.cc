@@ -24,6 +24,8 @@ extern "C" {
 #include <utility>
 #include <vector>
 #include <cstring>
+#include <fstream>
+#include <cstdio>
 
 #ifdef _WIN32
 #include <winsock2.h>
@@ -47,6 +49,7 @@ struct ProgramOptions {
     bool override_pts = false;
     int override_frame_index = -1;
     uint32_t override_rtp_timestamp = 0;
+    std::string capture_dir;
 
     static void print_help(const char* argv0)
     {
@@ -60,6 +63,7 @@ struct ProgramOptions {
                   << "  --gop N               GOP size / keyint (default: 30)\n"
                   << "  --max-frames N        Max frames to process (default: all)\n"
                   << "  --set-pts IDX VALUE   Override RTP timestamp of frame IDX (1-based index)\n"
+                  << "  --capture-dir DIR     Save captured frames and metadata to DIR\n"
                   << "  --buffered | -b       Buffer RTP packets before sending\n"
                   << "  --verbose | -v        Verbose logging\n"
                   << "  -h | --help           This help\n";
@@ -116,6 +120,10 @@ struct ProgramOptions {
                 override_pts = true;
                 override_frame_index = std::stoi(argv[++i]);
                 override_rtp_timestamp = static_cast<uint32_t>(std::stoul(argv[++i]));
+            } else if (a == "--capture-dir") {
+                if (!need("--capture-dir"))
+                    return false;
+                capture_dir = argv[++i];
             } else if (a == "--buffered" || a == "-b") {
                 buffered = true;
             } else if (a == "--verbose" || a == "-v") {
@@ -252,6 +260,82 @@ static bool overwrite_frame_timestamp(CapturedFrame& frame, uint32_t new_ts)
     }
 
     return updated;
+}
+
+static bool save_capture_to_disk(const std::string& directory, const std::vector<CapturedFrame>& frames)
+{
+    if (directory.empty())
+        return true;
+
+    fs::path base(directory);
+    std::error_code ec;
+    if (!fs::exists(base, ec)) {
+        if (!fs::create_directories(base, ec)) {
+            std::cerr << "Failed to create capture directory: " << base << "\n";
+            return false;
+        }
+    } else if (!fs::is_directory(base)) {
+        std::cerr << "Capture path is not a directory: " << base << "\n";
+        return false;
+    }
+
+    const fs::path csv_path = base / "capture.csv";
+    std::ofstream csv(csv_path, std::ios::out | std::ios::trunc);
+    if (!csv) {
+        std::cerr << "Failed to open capture CSV for writing: " << csv_path << "\n";
+        return false;
+    }
+
+    csv << "frame_index,offset_ns,captured_at_ns,original_rtp_ts,rtp_ts,first_sequence,last_sequence,packet_count,packet_files\n";
+
+    for (size_t idx = 0; idx < frames.size(); ++idx) {
+        const CapturedFrame& frame = frames[idx];
+        const size_t packet_count = frame.packets.size();
+
+        std::vector<std::string> file_names;
+        file_names.reserve(packet_count);
+
+        for (size_t pkt = 0; pkt < packet_count; ++pkt) {
+            char name[64];
+            std::snprintf(name, sizeof(name), "frame_%04zu_pkt_%03zu.pkt", idx + 1, pkt + 1);
+            std::string filename(name);
+            file_names.push_back(filename);
+
+            fs::path pkt_path = base / filename;
+            std::ofstream pkt_file(pkt_path, std::ios::binary | std::ios::out | std::ios::trunc);
+            if (!pkt_file) {
+                std::cerr << "Failed to open packet file for writing: " << pkt_path << "\n";
+                return false;
+            }
+            const auto& data = frame.packets[pkt];
+            pkt_file.write(reinterpret_cast<const char*>(data.data()), static_cast<std::streamsize>(data.size()));
+            if (!pkt_file) {
+                std::cerr << "Failed to write packet file: " << pkt_path << "\n";
+                return false;
+            }
+        }
+
+        auto offset_ns = frame.offset.count();
+        auto captured_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(frame.captured_at.time_since_epoch()).count();
+
+        csv << (idx + 1) << ','
+            << offset_ns << ','
+            << captured_ns << ','
+            << frame.original_rtp_timestamp << ','
+            << frame.rtp_timestamp << ','
+            << frame.first_sequence << ','
+            << frame.last_sequence << ','
+            << packet_count << ',';
+
+        for (size_t pkt = 0; pkt < file_names.size(); ++pkt) {
+            if (pkt)
+                csv << '|';
+            csv << file_names[pkt];
+        }
+        csv << '\n';
+    }
+
+    return true;
 }
 
 static bool replay_buffered_packets(uvgrtp::media_stream& stream,
@@ -805,6 +889,16 @@ static bool send_rtsp_annexb_sequence(const ProgramOptions& opt, const std::vect
             }
         }
 
+        if (!opt.capture_dir.empty()) {
+            if (!save_capture_to_disk(opt.capture_dir, buffered_frames)) {
+                std::cerr << "Failed to save capture to " << opt.capture_dir << "\n";
+                return false;
+            }
+            if (opt.verbose) {
+                std::cerr << "Saved capture to " << opt.capture_dir << "\n";
+            }
+        }
+
         std::cerr << "Replaying buffered packets...\n";
         if (!replay_buffered_packets(*strm, buffered_frames, opt.verbose)) {
             std::cerr << "Replay failed\n";
@@ -823,6 +917,11 @@ int main(int argc, char** argv)
     ProgramOptions opt;
     if (!opt.parse(argc, argv))
         return 1;
+
+    if (!opt.buffered && !opt.capture_dir.empty()) {
+        std::cerr << "--capture-dir requires --buffered\n";
+        return 1;
+    }
 
     std::vector<cv::Mat> frames;
     int W = 0;

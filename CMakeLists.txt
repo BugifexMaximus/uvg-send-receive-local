@@ -31,6 +31,9 @@ if (LIBAV_LDFLAGS_OTHER)
 endif()
 target_link_libraries(opencv_send_logger PRIVATE uvgrtp ${OpenCV_LIBS} ${LIBAV_LIBRARIES})
 
+add_executable(capture_replay examples/capture_replay.cc)
+target_link_libraries(capture_replay PRIVATE uvgrtp)
+
 add_executable(simple_receiver examples/simple_receiver.cpp)
 target_include_directories(simple_receiver PRIVATE ${LIBAV_INCLUDE_DIRS} ${OpenCV_INCLUDE_DIRS})
 target_compile_options(simple_receiver PRIVATE ${LIBAV_CFLAGS_OTHER})
