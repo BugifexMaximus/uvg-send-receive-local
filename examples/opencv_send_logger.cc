@@ -23,6 +23,13 @@ extern "C" {
 #include <thread>
 #include <utility>
 #include <vector>
+#include <cstring>
+
+#ifdef _WIN32
+#include <winsock2.h>
+#else
+#include <arpa/inet.h>
+#endif
 
 namespace fs = std::filesystem;
 
@@ -37,6 +44,9 @@ struct ProgramOptions {
     int max_frames = -1;
     bool verbose = false;
     bool buffered = false;
+    bool override_pts = false;
+    int override_frame_index = -1;
+    uint32_t override_rtp_timestamp = 0;
 
     static void print_help(const char* argv0)
     {
@@ -49,6 +59,7 @@ struct ProgramOptions {
                   << "  --bitrate N           Bitrate in bps (default: 1000000)\n"
                   << "  --gop N               GOP size / keyint (default: 30)\n"
                   << "  --max-frames N        Max frames to process (default: all)\n"
+                  << "  --set-pts IDX VALUE   Override RTP timestamp of frame IDX (1-based index)\n"
                   << "  --buffered | -b       Buffer RTP packets before sending\n"
                   << "  --verbose | -v        Verbose logging\n"
                   << "  -h | --help           This help\n";
@@ -97,6 +108,14 @@ struct ProgramOptions {
                 if (!need("--max-frames"))
                     return false;
                 max_frames = std::stoi(argv[++i]);
+            } else if (a == "--set-pts") {
+                if (i + 2 >= argc) {
+                    std::cerr << "--set-pts requires two arguments\n";
+                    return false;
+                }
+                override_pts = true;
+                override_frame_index = std::stoi(argv[++i]);
+                override_rtp_timestamp = static_cast<uint32_t>(std::stoul(argv[++i]));
             } else if (a == "--buffered" || a == "-b") {
                 buffered = true;
             } else if (a == "--verbose" || a == "-v") {
@@ -120,6 +139,10 @@ struct ProgramOptions {
         }
         if (gop <= 0) {
             std::cerr << "gop must be > 0\n";
+            return false;
+        }
+        if (override_pts && override_frame_index <= 0) {
+            std::cerr << "--set-pts index must be >= 1\n";
             return false;
         }
         return true;
@@ -202,12 +225,34 @@ struct SPSPPS {
 struct CapturedFrame {
     std::chrono::nanoseconds offset{0};
     std::chrono::steady_clock::time_point captured_at{};
+    uint32_t original_rtp_timestamp = 0;
     uint32_t rtp_timestamp = 0;
     uint16_t first_sequence = 0;
     uint16_t last_sequence = 0;
     std::size_t packet_count = 0;
     std::vector<std::vector<uint8_t>> packets;
 };
+
+static bool overwrite_frame_timestamp(CapturedFrame& frame, uint32_t new_ts)
+{
+    if (frame.packets.empty())
+        return false;
+
+    uint32_t ts_net = htonl(new_ts);
+    bool updated = false;
+    for (auto& packet : frame.packets) {
+        if (packet.size() < 12)
+            continue;
+        std::memcpy(packet.data() + 4, &ts_net, sizeof(ts_net));
+        updated = true;
+    }
+
+    if (updated) {
+        frame.rtp_timestamp = new_ts;
+    }
+
+    return updated;
+}
 
 static bool replay_buffered_packets(uvgrtp::media_stream& stream,
     const std::vector<CapturedFrame>& frames,
@@ -236,8 +281,11 @@ static bool replay_buffered_packets(uvgrtp::media_stream& stream,
         if (verbose) {
             std::cerr << "Replayed frame " << (frame_idx + 1) << " / " << frames.size()
                       << " containing " << frame.packets.size() << " packets"
-                      << " (rtp_ts=" << frame.rtp_timestamp
-                      << ", seq=" << frame.first_sequence << "-" << frame.last_sequence << ")\n";
+                      << " (rtp_ts=" << frame.rtp_timestamp;
+            if (frame.rtp_timestamp != frame.original_rtp_timestamp) {
+                std::cerr << ", original=" << frame.original_rtp_timestamp;
+            }
+            std::cerr << ", seq=" << frame.first_sequence << "-" << frame.last_sequence << ")\n";
         }
     }
 
@@ -677,10 +725,11 @@ static bool send_rtsp_annexb_sequence(const ProgramOptions& opt, const std::vect
                 CapturedFrame frame;
                 frame.offset = offset;
                 frame.captured_at = meta.captured_at;
+                frame.original_rtp_timestamp = meta.rtp_timestamp;
                 frame.rtp_timestamp = meta.rtp_timestamp;
                 frame.first_sequence = meta.first_sequence;
                 frame.last_sequence = meta.last_sequence;
-                frame.packet_count = meta.packet_count;
+                frame.packet_count = meta.packet_count ? meta.packet_count : packets.size();
                 frame.packets = std::move(packets);
                 buffered_frames.push_back(std::move(frame));
             },
@@ -736,6 +785,24 @@ static bool send_rtsp_annexb_sequence(const ProgramOptions& opt, const std::vect
         if (opt.verbose) {
             std::cerr << "Captured " << buffered_frames.size() << " frames spanning "
                       << total_packets << " RTP packets totaling " << total_bytes << " bytes\n";
+        }
+
+        if (opt.override_pts) {
+            int idx = opt.override_frame_index - 1;
+            if (idx < 0 || idx >= static_cast<int>(buffered_frames.size())) {
+                std::cerr << "--set-pts frame index " << opt.override_frame_index
+                          << " out of range (1-" << buffered_frames.size() << ")\n";
+                return false;
+            }
+            if (!overwrite_frame_timestamp(buffered_frames[idx], opt.override_rtp_timestamp)) {
+                std::cerr << "Failed to update RTP timestamp for frame " << opt.override_frame_index << "\n";
+                return false;
+            }
+            if (opt.verbose) {
+                std::cerr << "Updated frame " << opt.override_frame_index << " RTP timestamp from "
+                          << buffered_frames[idx].original_rtp_timestamp << " to "
+                          << buffered_frames[idx].rtp_timestamp << "\n";
+            }
         }
 
         std::cerr << "Replaying buffered packets...\n";
